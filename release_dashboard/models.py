@@ -23,51 +23,142 @@ class RiskLevel(str, Enum):
 
 
 # ---------------------------------------------------------------------------
+# Rich payload dataclasses — one per data source
+# ---------------------------------------------------------------------------
+
+@dataclass
+class PRDiff:
+    """Diff statistics extracted from a single GitHub Pull Request."""
+    lines_added: int = 0
+    lines_removed: int = 0
+    total_files: int = 0
+    source_files: int = 0       # .kt / .swift / .java / .py / .js / .ts …
+    test_files: int = 0         # paths containing test / spec / Test / Spec
+    config_files: int = 0       # .json / .yaml / .yml / .xml / .gradle / .plist …
+    has_test_changes: bool = False
+    days_open: int = 0          # PR created_at → merged_at
+    review_count: int = 0
+
+    @property
+    def churn(self) -> int:
+        """Total lines touched (additions + deletions)."""
+        return self.lines_added + self.lines_removed
+
+    @property
+    def is_large_change(self) -> bool:
+        """True when churn exceeds 500 lines."""
+        return self.churn > 500
+
+
+@dataclass
+class JiraMetadata:
+    """Full Jira Cloud issue metadata for a single ticket."""
+    summary: str = ""
+    status: str = ""            # "In Progress" | "Done" | "To Do" …
+    priority: str = ""          # "Blocker" | "Critical" | "High" | "Medium" | "Low"
+    issue_type: str = ""        # "Story" | "Bug" | "Task" | "Epic"
+    story_points: float = 0.0
+    sprint: str = ""
+    fix_version: str = ""
+    labels: List[str] = field(default_factory=list)
+
+
+@dataclass
+class TestExecution:
+    """QMetry test execution summary for one Jira ticket in a given cycle."""
+    total_cases: int = 0
+    passed: int = 0
+    failed: int = 0
+    blocked: int = 0
+    not_run: int = 0
+    in_regression: bool = False
+
+    @property
+    def test_case_exists(self) -> bool:
+        return self.total_cases > 0
+
+    @property
+    def executed(self) -> bool:
+        return (self.passed + self.failed + self.blocked) > 0
+
+    @property
+    def pass_rate(self) -> float:
+        ran = self.passed + self.failed + self.blocked
+        return round(self.passed / ran * 100, 1) if ran else 0.0
+
+
+# ---------------------------------------------------------------------------
 # Core feature model — single source of truth shared by all layers
 # ---------------------------------------------------------------------------
 
 @dataclass
 class Feature:
-    """Represents one development feature tied to a Jira ticket and a PR.
+    """One development feature, enriched progressively by each service layer.
 
-    Fields populated progressively as each service layer enriches the object:
-      - GitHub layer fills : jira_id, pr_number, files_changed, core_module,
-                             platform, repo, affects_both_platforms
-      - Jira layer fills   : jira_status, jira_sprint, jira_summary
-      - QMetry layer fills : test_case_exists, executed, in_regression
-      - Governance layer   : risk_score, risk_level
+    Enrichment pipeline
+    ───────────────────
+      GitHub layer   → jira_id, pr_number, files_changed, core_module, pr_diff
+      Jira layer     → jira_meta  (JiraMetadata)
+      QMetry layer   → test_exec  (TestExecution)
+      Governance     → code_risk_score, test_risk_score, jira_risk_score,
+                       risk_score, risk_level
 
     Platform values
-    ---------------
-      "android"  — from NBCUDTC/gst-apps-android
-      "ios"      — from NBCUDTC/gst-apps-ios
-      "config"   — from NBCUDTC/peacock-mobile-config (affects BOTH platforms)
+    ───────────────
+      "android"  — NBCUDTC/gst-apps-android
+      "ios"      — NBCUDTC/gst-apps-ios
+      "config"   — NBCUDTC/peacock-mobile-config  (affects BOTH platforms)
     """
 
-    # ── Source / identity ────────────────────────────────────────────────────
+    # ── Identity ──────────────────────────────────────────────────────────────
     jira_id: str = ""
     pr_number: int = 0
-    platform: str = ""          # "android" | "ios" | "config"
-    repo: str = ""              # full slug, e.g. "NBCUDTC/gst-apps-android"
-    affects_both_platforms: bool = False   # True for every config-repo feature
+    platform: str = ""
+    repo: str = ""
+    affects_both_platforms: bool = False
 
-    # ── GitHub-sourced ───────────────────────────────────────────────────────
+    # ── GitHub-sourced ────────────────────────────────────────────────────────
     files_changed: List[str] = field(default_factory=list)
     core_module: bool = False
+    pr_diff: Optional[PRDiff] = None
 
-    # ── QMetry-sourced (boolean flags only) ──────────────────────────────────
-    test_case_exists: bool = False
-    executed: bool = False
-    in_regression: bool = False
+    # ── Jira-sourced ──────────────────────────────────────────────────────────
+    jira_meta: Optional[JiraMetadata] = None
 
-    # ── Governance-computed ──────────────────────────────────────────────────
-    risk_score: int = 0
+    # ── QMetry-sourced ────────────────────────────────────────────────────────
+    test_exec: Optional[TestExecution] = None
+
+    # ── Governance-computed ───────────────────────────────────────────────────
+    code_risk_score: int = 0    # 0-10  (PR diff signals)
+    test_risk_score: int = 0    # 0-10  (test coverage & execution)
+    jira_risk_score: int = 0    # 0-10  (priority / type / status)
+    risk_score: int = 0         # 0-10  weighted composite
     risk_level: str = RiskLevel.UNKNOWN.value
 
-    # ── Jira enrichment ──────────────────────────────────────────────────────
-    jira_status: str = ""
-    jira_sprint: str = ""
-    jira_summary: str = ""
+    # ── Convenience properties (delegate to rich objects) ─────────────────────
+    @property
+    def test_case_exists(self) -> bool:
+        return self.test_exec.test_case_exists if self.test_exec else False
+
+    @property
+    def executed(self) -> bool:
+        return self.test_exec.executed if self.test_exec else False
+
+    @property
+    def in_regression(self) -> bool:
+        return self.test_exec.in_regression if self.test_exec else False
+
+    @property
+    def jira_status(self) -> str:
+        return self.jira_meta.status if self.jira_meta else ""
+
+    @property
+    def jira_sprint(self) -> str:
+        return self.jira_meta.sprint if self.jira_meta else ""
+
+    @property
+    def jira_summary(self) -> str:
+        return self.jira_meta.summary if self.jira_meta else ""
 
 
 # ---------------------------------------------------------------------------

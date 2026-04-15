@@ -1,27 +1,25 @@
 """
-QMetry Service — boolean test-coverage flags per Jira ticket.
+QMetry Service — test execution counts per Jira ticket.
 
-Design note
------------
-This service deliberately returns *only* boolean flags (test_case_exists,
-executed, in_regression). No complex mapping is performed here; that
-responsibility belongs to the Governance Engine.
+Each feature is enriched with a :class:`TestExecution` object carrying
+pass / fail / blocked / not_run counts, in_regression flag, and a computed
+pass_rate.  Boolean convenience properties (test_case_exists, executed) are
+derived from those counts inside the TestExecution dataclass.
 
-QMetry API used
----------------
-  POST /rest/api/2/testcase/search   — search test cases by label / summary
-  GET  /rest/api/2/testcycle/{id}/testcase — list test cases in a cycle
+QMetry API used (QTM4J — Test Management for Jira)
+───────────────────────────────────────────────────
+  POST /rest/api/2/testcase/search          — search by summary / label
+  GET  /rest/api/2/testcycle/{id}/testcase  — execution list for a cycle
 
-Both endpoints belong to QMetry Test Management for Jira (QTM4J).
-Adjust base_url and paths if you use the standalone QMetry platform.
+Adjust base_url / paths for standalone QMetry if needed.
 """
 
 import logging
-from typing import List
+from typing import List, Optional
 
 import requests
 
-from models import Feature
+from models import Feature, TestExecution
 
 logger = logging.getLogger(__name__)
 
@@ -45,68 +43,71 @@ class QMetryService:
         )
 
     # ------------------------------------------------------------------
-    # Public — primary boolean checks
+    # Public — full execution summary
     # ------------------------------------------------------------------
 
-    def check_test_case_exists(self, jira_id: str) -> bool:
-        """Return True if at least one test case exists whose summary/label
-        contains *jira_id*.
+    def get_test_execution_summary(
+        self,
+        jira_id: str,
+        cycle_id: str,
+        regression_cycle_id: str = "",
+    ) -> TestExecution:
+        """Return a :class:`TestExecution` with pass/fail/blocked/not_run counts.
 
-        Searches QMetry for test cases labelled with the Jira ticket key.
+        Steps
+        -----
+        1. Search for test cases matching *jira_id* (existence check).
+        2. Walk the given *cycle_id* to tally execution statuses.
+        3. Optionally check *regression_cycle_id* for the ``in_regression`` flag.
         """
-        url = f"{self.base_url}/rest/api/2/testcase/search"
-        payload = {
-            "maxResults": 1,
-            "startAt": 0,
-            "query": jira_id,          # free-text search across summary & labels
-        }
-        try:
-            response = self._session.post(url, json=payload)
-            response.raise_for_status()
-            data = response.json()
-            total = data.get("total", data.get("totalCount", len(data.get("data", []))))
-            return int(total) > 0
-        except requests.RequestException as exc:
-            logger.warning("QMetry test-case search failed for %s: %s", jira_id, exc)
-            return False
+        # ── 1. Existence check ──────────────────────────────────────────
+        exists = self._test_case_exists(jira_id)
+        if not exists:
+            return TestExecution()   # all zeros / False
 
-    def check_test_executed(self, jira_id: str, cycle_id: str) -> bool:
-        """Return True if a test case linked to *jira_id* was executed
-        (status is not 'NOT_RUN') within the given *cycle_id*.
-        """
-        url = f"{self.base_url}/rest/api/2/testcycle/{cycle_id}/testcase"
-        try:
-            response = self._session.get(url, params={"maxResults": 200})
-            response.raise_for_status()
-            cases = response.json().get("data", [])
+        # ── 2. Execution counts from the release cycle ──────────────────
+        passed = failed = blocked = not_run = 0
+        if cycle_id:
+            cases = self._fetch_cycle_cases(cycle_id)
             for case in cases:
-                if self._case_matches_jira_id(case, jira_id):
-                    status = (case.get("executionStatus") or case.get("status") or "").upper()
-                    return status not in ("", "NOT_RUN", "NOTRUN", "UNEXECUTED")
-            return False
-        except requests.RequestException as exc:
-            logger.warning(
-                "QMetry cycle execution check failed (cycle=%s, jira=%s): %s",
-                cycle_id, jira_id, exc,
-            )
-            return False
+                if not self._case_matches_jira_id(case, jira_id):
+                    continue
+                raw_status = (
+                    case.get("executionStatus")
+                    or case.get("status")
+                    or "NOT_RUN"
+                ).upper().replace(" ", "_")
 
-    def check_in_regression(self, jira_id: str, regression_cycle_id: str) -> bool:
-        """Return True if a test case linked to *jira_id* is present in the
-        designated regression test cycle.
-        """
-        url = f"{self.base_url}/rest/api/2/testcycle/{regression_cycle_id}/testcase"
-        try:
-            response = self._session.get(url, params={"maxResults": 500})
-            response.raise_for_status()
-            cases = response.json().get("data", [])
-            return any(self._case_matches_jira_id(c, jira_id) for c in cases)
-        except requests.RequestException as exc:
-            logger.warning(
-                "QMetry regression check failed (cycle=%s, jira=%s): %s",
-                regression_cycle_id, jira_id, exc,
-            )
-            return False
+                if raw_status in ("PASS", "PASSED"):
+                    passed += 1
+                elif raw_status in ("FAIL", "FAILED"):
+                    failed += 1
+                elif raw_status in ("BLOCKED", "BLOCK"):
+                    blocked += 1
+                else:
+                    not_run += 1
+
+        # If the test case exists but nothing was found in the cycle,
+        # record it as not_run so the counts add up to at least 1.
+        total = passed + failed + blocked + not_run
+        if total == 0:
+            not_run = 1
+            total = 1
+
+        # ── 3. Regression membership ────────────────────────────────────
+        in_reg = False
+        if regression_cycle_id:
+            reg_cases = self._fetch_cycle_cases(regression_cycle_id)
+            in_reg = any(self._case_matches_jira_id(c, jira_id) for c in reg_cases)
+
+        return TestExecution(
+            total_cases=total,
+            passed=passed,
+            failed=failed,
+            blocked=blocked,
+            not_run=not_run,
+            in_regression=in_reg,
+        )
 
     # ------------------------------------------------------------------
     # Bulk feature enrichment
@@ -118,13 +119,9 @@ class QMetryService:
         cycle_id: str,
         regression_cycle_id: str = "",
     ) -> Feature:
-        """Populate the three QMetry boolean flags on a :class:`Feature` in-place."""
-        feature.test_case_exists = self.check_test_case_exists(feature.jira_id)
-        feature.executed = self.check_test_executed(feature.jira_id, cycle_id) if cycle_id else False
-        feature.in_regression = (
-            self.check_in_regression(feature.jira_id, regression_cycle_id)
-            if regression_cycle_id
-            else False
+        """Attach a :class:`TestExecution` to *feature.test_exec* in-place."""
+        feature.test_exec = self.get_test_execution_summary(
+            feature.jira_id, cycle_id, regression_cycle_id
         )
         return feature
 
@@ -134,8 +131,35 @@ class QMetryService:
         cycle_id: str,
         regression_cycle_id: str = "",
     ) -> List[Feature]:
-        """Bulk-enrich a list of :class:`Feature` objects with QMetry flags."""
+        """Bulk-enrich a list of :class:`Feature` objects."""
         return [self.enrich_feature(f, cycle_id, regression_cycle_id) for f in features]
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    def _test_case_exists(self, jira_id: str) -> bool:
+        url = f"{self.base_url}/rest/api/2/testcase/search"
+        payload = {"maxResults": 1, "startAt": 0, "query": jira_id}
+        try:
+            resp = self._session.post(url, json=payload)
+            resp.raise_for_status()
+            data = resp.json()
+            total = data.get("total", data.get("totalCount", len(data.get("data", []))))
+            return int(total) > 0
+        except requests.RequestException as exc:
+            logger.warning("QMetry search failed for %s: %s", jira_id, exc)
+            return False
+
+    def _fetch_cycle_cases(self, cycle_id: str) -> list:
+        url = f"{self.base_url}/rest/api/2/testcycle/{cycle_id}/testcase"
+        try:
+            resp = self._session.get(url, params={"maxResults": 500})
+            resp.raise_for_status()
+            return resp.json().get("data", [])
+        except requests.RequestException as exc:
+            logger.warning("QMetry cycle fetch failed (cycle=%s): %s", cycle_id, exc)
+            return []
 
     # ------------------------------------------------------------------
     # Internal helpers

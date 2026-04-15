@@ -1,15 +1,17 @@
 """
-Jira Service — fetches issue/bug data for a given release version
-and enriches Feature objects with per-ticket status and sprint information.
+Jira Service — fetches full issue metadata per Jira ticket and enriches
+Feature objects with a JiraMetadata payload (priority, type, story points,
+fix version, labels, sprint, status).
 """
 
 import logging
+import re
 from typing import Any, Dict, List, Optional
 
 import requests
 from requests.auth import HTTPBasicAuth
 
-from models import Feature, JiraData, JiraIssue
+from models import Feature, JiraData, JiraIssue, JiraMetadata
 
 logger = logging.getLogger(__name__)
 
@@ -105,41 +107,57 @@ class JiraService:
         )
 
     # ------------------------------------------------------------------
-    # Per-ticket enrichment (Step 4)
+    # Per-ticket enrichment — full metadata
     # ------------------------------------------------------------------
 
-    def get_issue_details(self, jira_id: str) -> Dict[str, Any]:
-        """Fetch status, sprint, and summary for a single Jira ticket.
+    # Jira Cloud field IDs
+    _FIELDS = ",".join([
+        "summary", "status", "priority", "issuetype",
+        "fixVersions", "labels",
+        "customfield_10016",   # Story Points (Jira Cloud)
+        "customfield_10020",   # Sprint (Jira Cloud)
+    ])
 
-        Returns a dict with keys: ``status``, ``sprint``, ``summary``.
-        Falls back to empty strings on error so callers never have to guard.
+    def get_full_metadata(self, jira_id: str) -> Optional[JiraMetadata]:
+        """Fetch complete metadata for a single Jira ticket.
+
+        Returns a :class:`JiraMetadata` or ``None`` on error so the
+        caller can decide how to handle missing data.
         """
         url = f"{self.base_url}/rest/api/3/issue/{jira_id}"
-        fields_param = "summary,status,sprint,customfield_10020"  # cf 10020 = Sprint (classic)
         try:
-            response = self._session.get(url, params={"fields": fields_param})
-            response.raise_for_status()
-            raw = response.json()
-            fields = raw.get("fields", {})
+            resp = self._session.get(url, params={"fields": self._FIELDS})
+            resp.raise_for_status()
+            f = resp.json().get("fields", {})
 
-            # Sprint may live in customfield_10020 (list) or the "sprint" field
-            sprint = self._extract_sprint_name(fields)
+            # Story points — cloud field or fallback
+            sp_raw = f.get("customfield_10016") or f.get("story_points") or 0
+            try:
+                story_points = float(sp_raw)
+            except (TypeError, ValueError):
+                story_points = 0.0
 
-            return {
-                "status": fields.get("status", {}).get("name", ""),
-                "sprint": sprint,
-                "summary": fields.get("summary", ""),
-            }
+            # Fix version — first entry
+            fix_versions = f.get("fixVersions") or []
+            fix_version = fix_versions[0].get("name", "") if fix_versions else ""
+
+            return JiraMetadata(
+                summary=f.get("summary", ""),
+                status=f.get("status", {}).get("name", ""),
+                priority=f.get("priority", {}).get("name", ""),
+                issue_type=f.get("issuetype", {}).get("name", ""),
+                story_points=story_points,
+                sprint=self._extract_sprint_name(f),
+                fix_version=fix_version,
+                labels=f.get("labels") or [],
+            )
         except requests.RequestException as exc:
-            logger.warning("Could not fetch Jira issue %s: %s", jira_id, exc)
-            return {"status": "", "sprint": "", "summary": ""}
+            logger.warning("Could not fetch Jira metadata for %s: %s", jira_id, exc)
+            return None
 
     def enrich_feature(self, feature: Feature) -> Feature:
-        """Enrich a :class:`Feature` in-place with Jira status/sprint/summary."""
-        details = self.get_issue_details(feature.jira_id)
-        feature.jira_status = details["status"]
-        feature.jira_sprint = details["sprint"]
-        feature.jira_summary = details["summary"]
+        """Attach a :class:`JiraMetadata` to *feature* in-place."""
+        feature.jira_meta = self.get_full_metadata(feature.jira_id)
         return feature
 
     def enrich_features(self, features: List[Feature]) -> List[Feature]:
@@ -162,6 +180,6 @@ class JiraService:
                 return last.get("name", "")
             # Some configurations return a raw string like "com.atlassian.greenhopper…name=Sprint 3,…"
             if isinstance(last, str):
-                match = __import__("re").search(r"name=([^,\]]+)", last)
+                match = re.search(r"name=([^,\]]+)", last)
                 return match.group(1) if match else last
         return ""

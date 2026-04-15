@@ -19,71 +19,156 @@ from models import (
 
 logger = logging.getLogger(__name__)
 
-# ---------------------------------------------------------------------------
-# Risk scoring weights
-# ---------------------------------------------------------------------------
-#
-# Each "bad" signal adds points → higher score = higher risk.
-#
-#   No test case exists  : +4   (nothing to run even if we wanted to)
-#   Not executed         : +3   (test exists but was never run)
-#   Not in regression    : +2   (not part of the safety net)
-#   Core module touched  : +2   (blast radius multiplier)
-#
-# Maximum possible score = 11
-#
-_W_NO_TEST_CASE   = 4
-_W_NOT_EXECUTED   = 3
-_W_NOT_REGRESSION = 2
-_W_CORE_MODULE    = 2
+
+def _score_code_risk(feature: Feature) -> int:
+    """Score 0-10 based on PR diff signals.
+
+    Signal                                Points
+    ─────────────────────────────────────────────
+    core_module touched                    +2
+    affects_both_platforms (config repo)   +1
+    Churn > 500 lines                      +2
+    Churn 200-500 lines                    +1
+    Source changes with NO test changes    +2
+    Config files changed                   +1
+    PR open > 14 days (stale/risky)        +2
+    PR open 7-14 days                      +1
+    """
+    score = 0
+    diff = feature.pr_diff
+
+    if feature.core_module:
+        score += 2
+    if feature.affects_both_platforms:
+        score += 1
+
+    if diff:
+        if diff.churn > 500:
+            score += 2
+        elif diff.churn > 200:
+            score += 1
+        if diff.source_files > 0 and not diff.has_test_changes:
+            score += 2
+        if diff.config_files > 0:
+            score += 1
+        if diff.days_open > 14:
+            score += 2
+        elif diff.days_open > 7:
+            score += 1
+
+    return min(score, 10)
+
+
+def _score_test_risk(feature: Feature) -> int:
+    """Score 0-10 based on QMetry test execution data.
+
+    Signal                                Points
+    ─────────────────────────────────────────────
+    No test case exists at all             +5
+    Test exists but never executed         +3
+    Not in regression suite                +2
+    Has failed test cases                  +2
+    Has blocked test cases                 +1
+    Pass rate < 100% (but > 0%)           +1
+    """
+    score = 0
+    te = feature.test_exec
+
+    if te is None or not te.test_case_exists:
+        score += 5
+    else:
+        if not te.executed:
+            score += 3
+        if not te.in_regression:
+            score += 2
+        if te.failed > 0:
+            score += 2
+        if te.blocked > 0:
+            score += 1
+        if 0 < te.pass_rate < 100:
+            score += 1
+
+    return min(score, 10)
+
+
+def _score_jira_risk(feature: Feature) -> int:
+    """Score 0-10 based on Jira metadata.
+
+    Signal                                Points
+    ─────────────────────────────────────────────
+    Priority Blocker                       +4
+    Priority Critical                      +3
+    Priority High                          +2
+    Priority Medium                        +1
+    Issue type is Bug / Defect             +2
+    Status not Done / Closed / Resolved    +2
+    No fix version set                     +1
+    No story points                        +1
+    """
+    score = 0
+    jm = feature.jira_meta
+
+    if jm is None:
+        return 4   # unknown metadata → conservative medium-high score
+
+    _priority_pts = {"Blocker": 4, "Critical": 3, "High": 2, "Medium": 1, "Low": 0}
+    score += _priority_pts.get(jm.priority, 1)
+
+    if jm.issue_type in ("Bug", "Defect"):
+        score += 2
+
+    _done_statuses = {"Done", "Closed", "Resolved", "Released", "Won't Fix"}
+    if jm.status not in _done_statuses:
+        score += 2
+
+    if not jm.fix_version:
+        score += 1
+    if jm.story_points == 0:
+        score += 1
+
+    return min(score, 10)
 
 
 def calculate_risk(feature: Feature) -> Feature:
-    """Compute ``risk_score`` and ``risk_level`` for *feature* and return it.
+    """Compute multi-dimensional risk scores and set risk_level on *feature*.
 
-    Scoring table (higher = riskier):
-    ┌─────────────────────────────┬────────┐
-    │ Signal                      │ Points │
-    ├─────────────────────────────┼────────┤
-    │ test_case_exists = False    │   +4   │
-    │ executed         = False    │   +3   │
-    │ in_regression    = False    │   +2   │
-    │ core_module      = True     │   +2   │
-    └─────────────────────────────┴────────┘
+    Weighted composite
+    ──────────────────
+      test_risk  ×  0.50   (biggest driver — no tests = ship blind)
+      code_risk  ×  0.30   (churn, core modules, PR staleness)
+      jira_risk  ×  0.20   (priority, bug type, no fix version)
 
-    Risk levels:
-      0 – 2  → LOW
-      3 – 5  → MEDIUM
-      6 – 8  → HIGH
-      9+     → CRITICAL
+    Risk levels  (0-10 scale)
+    ──────────────────────────
+      0 – 2  →  LOW
+      3 – 4  →  MEDIUM
+      5 – 7  →  HIGH
+      8 – 10 →  CRITICAL
     """
-    score = 0
+    code  = _score_code_risk(feature)
+    test  = _score_test_risk(feature)
+    jira  = _score_jira_risk(feature)
+    composite = round(code * 0.30 + test * 0.50 + jira * 0.20)
 
-    if not feature.test_case_exists:
-        score += _W_NO_TEST_CASE
-    if not feature.executed:
-        score += _W_NOT_EXECUTED
-    if not feature.in_regression:
-        score += _W_NOT_REGRESSION
-    if feature.core_module:
-        score += _W_CORE_MODULE
-
-    if score <= 2:
+    if composite <= 2:
         level = RiskLevel.LOW
-    elif score <= 5:
+    elif composite <= 4:
         level = RiskLevel.MEDIUM
-    elif score <= 8:
+    elif composite <= 7:
         level = RiskLevel.HIGH
     else:
         level = RiskLevel.CRITICAL
 
-    feature.risk_score = score
-    feature.risk_level = level.value
+    feature.code_risk_score = code
+    feature.test_risk_score = test
+    feature.jira_risk_score = jira
+    feature.risk_score      = composite
+    feature.risk_level      = level.value
     return feature
 
 
 def calculate_risk_for_all(features: List[Feature]) -> List[Feature]:
-    """Apply :func:`calculate_risk` to every feature in *features* in-place."""
+    """Apply :func:`calculate_risk` to every feature in *features*."""
     return [calculate_risk(f) for f in features]
 
 
