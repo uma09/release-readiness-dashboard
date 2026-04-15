@@ -73,23 +73,25 @@ with st.sidebar:
 
     st.subheader("🌿 Branches")
 
-    # Fetch branches per repo (cached; shown as spinner inside the sidebar)
+    # Fetch branches per repo (cached 5 min)
     with st.spinner("Loading branches from GitHub …"):
         _branches_android = _fetch_repo_branches(Config.GITHUB_TOKEN, Config.GITHUB_REPO_ANDROID)
         _branches_ios     = _fetch_repo_branches(Config.GITHUB_TOKEN, Config.GITHUB_REPO_IOS)
         _branches_config  = _fetch_repo_branches(Config.GITHUB_TOKEN, Config.GITHUB_REPO_CONFIG)
 
-    # Base branch — union of all three repos, de-duplicated & priority-sorted
+    # Release branch — union of all three repos so any release/x.x branch is visible
     _all_branches = list(dict.fromkeys(
         [b for b in _PRIORITY_BRANCHES
          if b in _branches_android or b in _branches_ios or b in _branches_config]
         + sorted({*_branches_android, *_branches_ios, *_branches_config}
                  - set(_PRIORITY_BRANCHES))
     ))
-    base_branch  = _branch_select("Base branch (all repos)",  _all_branches,     Config.GITHUB_BASE_BRANCH)
-    android_head = _branch_select("🤖 Android head branch",   _branches_android, Config.GITHUB_HEAD_BRANCH_ANDROID)
-    ios_head     = _branch_select("🍎 iOS head branch",        _branches_ios,     Config.GITHUB_HEAD_BRANCH_IOS)
-    config_head  = _branch_select("⚙️ Config head branch",   _branches_config,  Config.GITHUB_HEAD_BRANCH_CONFIG)
+
+    st.caption("Diff = develop → release branch (what's shipping)")
+    release_branch   = _branch_select("🚀 Release branch",    _all_branches,     Config.GITHUB_BASE_BRANCH)
+    android_develop  = _branch_select("🤖 Android develop",   _branches_android, Config.GITHUB_HEAD_BRANCH_ANDROID)
+    ios_develop      = _branch_select("🍎 iOS develop",        _branches_ios,     Config.GITHUB_HEAD_BRANCH_IOS)
+    config_develop   = _branch_select("⚙️ Config develop",   _branches_config,  Config.GITHUB_HEAD_BRANCH_CONFIG)
 
     st.subheader("🧪 QMetry Test Cycles")
     android_cycle     = st.text_input("Android cycle ID",          value=Config.QMETRY_CYCLE_ID_ANDROID)
@@ -103,8 +105,8 @@ with st.sidebar:
 # ── Title ─────────────────────────────────────────────────────────────────────
 st.title("🦚 Peacock Mobile — Release Risk Engine")
 st.caption(
-    f"Base: **{base_branch}** · "
-    f"🤖 `{android_head}` · 🍎 `{ios_head}` · ⚙️ `{config_head}`"
+    f"🚀 Release: **`{release_branch}`** ← develop: "
+    f"🤖 `{android_develop}` · 🍎 `{ios_develop}` · ⚙️ `{config_develop}`"
 )
 
 # ── Constants & helpers ───────────────────────────────────────────────────────
@@ -276,12 +278,18 @@ def _platform_panel(features: list, platform: str, repo: str, head: str):
 # ── Pipeline ──────────────────────────────────────────────────────────────────
 @st.cache_data(show_spinner=False)
 def run_validation(
-    base: str,
-    a_head: str, i_head: str, c_head: str,
-    a_cyc: str,  i_cyc: str,
-    a_reg: str,  i_reg: str,
+    release: str,
+    a_dev: str, i_dev: str, c_dev: str,
+    a_cyc: str, i_cyc: str,
+    a_reg: str, i_reg: str,
 ):
-    # 1. GitHub — one service per repo, each stamping its platform + PRDiff
+    """Compare develop → release branch for each repo.
+
+    PyGithub compare(base, head) returns commits in *head* not in *base*.
+    base = develop branch  →  head = release branch
+    Result: every commit that is in the release but not yet in develop
+            (hotfixes) PLUS all PRs whose commits landed on the release branch.
+    """
     gh_android = GitHubService(Config.GITHUB_TOKEN, Config.GITHUB_REPO_ANDROID,
                                platform="android", core_module_paths=Config.CORE_MODULE_PATHS_ANDROID)
     gh_ios     = GitHubService(Config.GITHUB_TOKEN, Config.GITHUB_REPO_IOS,
@@ -289,9 +297,10 @@ def run_validation(
     gh_config  = GitHubService(Config.GITHUB_TOKEN, Config.GITHUB_REPO_CONFIG,
                                platform="config",  force_core_module=True)
 
-    android_feats = gh_android.get_merged_features(base, a_head)
-    ios_feats     = gh_ios.get_merged_features(base, i_head)
-    config_feats  = gh_config.get_merged_features(base, c_head)
+    # base = develop, head = release  →  diff shows what's in the release
+    android_feats = gh_android.get_merged_features(base_branch=a_dev, head_branch=release)
+    ios_feats     = gh_ios.get_merged_features(base_branch=i_dev,     head_branch=release)
+    config_feats  = gh_config.get_merged_features(base_branch=c_dev,  head_branch=release)
 
     # 2. Jira — full metadata (JiraMetadata) per ticket
     jira      = JiraService(Config.JIRA_URL, Config.JIRA_USER, Config.JIRA_TOKEN)
@@ -320,8 +329,8 @@ if st.button("▶️ Run Release Risk Analysis", type="primary", use_container_w
     with st.spinner("🔍 GitHub → Jira → QMetry → Governance Engine …"):
         try:
             features = run_validation(
-                base_branch,
-                android_head, ios_head, config_head,
+                release_branch,
+                android_develop, ios_develop, config_develop,
                 android_cycle, ios_cycle,
                 android_reg_cycle, ios_reg_cycle,
             )
@@ -387,14 +396,14 @@ if st.session_state.get("validated"):
                 _drill_down(f)
 
     with tab_android:
-        _platform_panel(android_feats, "android", Config.GITHUB_REPO_ANDROID, android_head)
+        _platform_panel(android_feats, "android", Config.GITHUB_REPO_ANDROID, android_develop)
 
     with tab_ios:
-        _platform_panel(ios_feats, "ios", Config.GITHUB_REPO_IOS, ios_head)
+        _platform_panel(ios_feats, "ios", Config.GITHUB_REPO_IOS, ios_develop)
 
     with tab_config:
         st.info("⚠️ Every config change has `core_module = True` and `affects_both_platforms = True`.")
-        _platform_panel(config_feats, "config", Config.GITHUB_REPO_CONFIG, config_head)
+        _platform_panel(config_feats, "config", Config.GITHUB_REPO_CONFIG, config_develop)
 
 else:
     st.info("👆 Click **Run Release Risk Analysis** to fetch and score your release features.")
