@@ -19,6 +19,7 @@ sys.path.insert(0, os.path.dirname(__file__))
 
 import pandas as pd
 import streamlit as st
+from github import Github, GithubException
 
 from config import Config
 from engine.governance_engine import calculate_risk_for_all
@@ -34,16 +35,61 @@ st.set_page_config(
     layout="wide",
 )
 
+# ── Branch fetching (cached 5 min) ───────────────────────────────────────────
+# Priority-sorted branch names shown at the top of every dropdown.
+_PRIORITY_BRANCHES = ["main", "master", "develop", "release", "staging"]
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def _fetch_repo_branches(token: str, repo: str) -> list[str]:
+    """Return sorted branch names for *repo*. Empty list on auth/network error."""
+    if not token:
+        return []
+    try:
+        names = sorted(b.name for b in Github(token).get_repo(repo).get_branches())
+        top  = [b for b in _PRIORITY_BRANCHES if b in names]
+        rest = [b for b in names if b not in _PRIORITY_BRANCHES]
+        return top + rest
+    except GithubException as exc:
+        st.sidebar.warning(f"Could not load branches for `{repo}`: {exc.data.get('message', exc)}")
+        return []
+    except Exception as exc:
+        st.sidebar.warning(f"Branch fetch error for `{repo}`: {exc}")
+        return []
+
+
+def _branch_select(label: str, branches: list[str], default: str) -> str:
+    """Selectbox when branches are available, text_input fallback otherwise."""
+    if branches:
+        idx = branches.index(default) if default in branches else 0
+        return st.selectbox(label, branches, index=idx)
+    return st.text_input(label, value=default)
+
+
 # ── Sidebar ───────────────────────────────────────────────────────────────────
 with st.sidebar:
     st.image("https://upload.wikimedia.org/wikipedia/commons/thumb/9/9f/Peacock_tv_logo.svg/320px-Peacock_tv_logo.svg.png", width=140)
     st.title("⚙️ Configuration")
 
     st.subheader("🌿 Branches")
-    base_branch       = st.text_input("Base branch (all repos)",  value=Config.GITHUB_BASE_BRANCH)
-    android_head      = st.text_input("🤖 Android head branch",   value=Config.GITHUB_HEAD_BRANCH_ANDROID)
-    ios_head          = st.text_input("🍎 iOS head branch",        value=Config.GITHUB_HEAD_BRANCH_IOS)
-    config_head       = st.text_input("⚙️ Config head branch",   value=Config.GITHUB_HEAD_BRANCH_CONFIG)
+
+    # Fetch branches per repo (cached; shown as spinner inside the sidebar)
+    with st.spinner("Loading branches from GitHub …"):
+        _branches_android = _fetch_repo_branches(Config.GITHUB_TOKEN, Config.GITHUB_REPO_ANDROID)
+        _branches_ios     = _fetch_repo_branches(Config.GITHUB_TOKEN, Config.GITHUB_REPO_IOS)
+        _branches_config  = _fetch_repo_branches(Config.GITHUB_TOKEN, Config.GITHUB_REPO_CONFIG)
+
+    # Base branch — union of all three repos, de-duplicated & priority-sorted
+    _all_branches = list(dict.fromkeys(
+        [b for b in _PRIORITY_BRANCHES
+         if b in _branches_android or b in _branches_ios or b in _branches_config]
+        + sorted({*_branches_android, *_branches_ios, *_branches_config}
+                 - set(_PRIORITY_BRANCHES))
+    ))
+    base_branch  = _branch_select("Base branch (all repos)",  _all_branches,     Config.GITHUB_BASE_BRANCH)
+    android_head = _branch_select("🤖 Android head branch",   _branches_android, Config.GITHUB_HEAD_BRANCH_ANDROID)
+    ios_head     = _branch_select("🍎 iOS head branch",        _branches_ios,     Config.GITHUB_HEAD_BRANCH_IOS)
+    config_head  = _branch_select("⚙️ Config head branch",   _branches_config,  Config.GITHUB_HEAD_BRANCH_CONFIG)
 
     st.subheader("🧪 QMetry Test Cycles")
     android_cycle     = st.text_input("Android cycle ID",          value=Config.QMETRY_CYCLE_ID_ANDROID)
