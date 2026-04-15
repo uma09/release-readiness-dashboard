@@ -59,11 +59,15 @@ def _fetch_repo_branches(token: str, repo: str) -> list[str]:
 
 
 def _branch_select(label: str, branches: list[str], default: str) -> str:
-    """Selectbox when branches are available, text_input fallback otherwise."""
-    if branches:
-        idx = branches.index(default) if default in branches else 0
-        return st.selectbox(label, branches, index=idx)
-    return st.text_input(label, value=default)
+    """Always renders a st.selectbox.
+
+    When *branches* is populated (GITHUB_TOKEN set) → full live branch list.
+    When *branches* is empty (token missing / API error) → selectbox with just
+    the configured default so the UI always shows a dropdown, never a text box.
+    """
+    options = branches if branches else [default]
+    idx = options.index(default) if default in options else 0
+    return st.selectbox(label, options, index=idx)
 
 
 # ── Sidebar ───────────────────────────────────────────────────────────────────
@@ -74,7 +78,9 @@ with st.sidebar:
     st.subheader("🌿 Branches")
 
     # Fetch branches per repo (cached 5 min)
-    with st.spinner("Loading branches from GitHub …"):
+    if not Config.GITHUB_TOKEN:
+        st.warning("⚠️ Set **GITHUB_TOKEN** to load live branch lists from GitHub.")
+    with st.spinner("Loading branches …"):
         _branches_android = _fetch_repo_branches(Config.GITHUB_TOKEN, Config.GITHUB_REPO_ANDROID)
         _branches_ios     = _fetch_repo_branches(Config.GITHUB_TOKEN, Config.GITHUB_REPO_IOS)
         _branches_config  = _fetch_repo_branches(Config.GITHUB_TOKEN, Config.GITHUB_REPO_CONFIG)
