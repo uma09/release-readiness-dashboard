@@ -39,10 +39,13 @@ class Config:
     GITHUB_LOCAL_REPO_IOS: str     = os.getenv("GITHUB_LOCAL_REPO_IOS",     os.path.join(_home, "repos", "gst-apps-ios"))
     GITHUB_LOCAL_REPO_CONFIG: str  = os.getenv("GITHUB_LOCAL_REPO_CONFIG",  os.path.join(_home, "repos", "peacock-mobile-config"))
 
-    # Shared base branch (the stable / production branch in every repo)
-    GITHUB_BASE_BRANCH: str = os.getenv("GITHUB_BASE_BRANCH", "main")
+    # Per-platform release branches (the versioned cuts being validated)
+    # Android and iOS ship independently and can be on different release numbers.
+    GITHUB_RELEASE_BRANCH_ANDROID: str = os.getenv("GITHUB_RELEASE_BRANCH_ANDROID", "release/7.4.31")
+    GITHUB_RELEASE_BRANCH_IOS: str     = os.getenv("GITHUB_RELEASE_BRANCH_IOS",     "release/7.4.32")
+    GITHUB_RELEASE_BRANCH_CONFIG: str  = os.getenv("GITHUB_RELEASE_BRANCH_CONFIG",  "release/7.4.31")
 
-    # Per-repo head branches (the release-candidate / integration branch)
+    # Per-platform develop branches (the stable integration base to diff from)
     GITHUB_HEAD_BRANCH_ANDROID: str = os.getenv("GITHUB_HEAD_BRANCH_ANDROID", "develop")
     GITHUB_HEAD_BRANCH_IOS: str     = os.getenv("GITHUB_HEAD_BRANCH_IOS",     "develop")
     GITHUB_HEAD_BRANCH_CONFIG: str  = os.getenv("GITHUB_HEAD_BRANCH_CONFIG",  "develop")
