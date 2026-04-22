@@ -1,66 +1,127 @@
 """
-GitHub Service — fetches merged PRs between two branches using PyGithub,
-extracts Jira IDs from PR titles, and attaches rich diff statistics (PRDiff)
-to each Feature object.
+GitHub Service — reads data from LOCAL git clones instead of the GitHub REST API.
+
+Authentication is handled transparently by the SSH key (~/.ssh/id_nbcu) that
+is already loaded in the macOS Keychain — the same key GitHub Desktop and the
+qa-certification-skill scripts use.  No GitHub PAT is required.
+
+Local repo layout (default):
+    ~/repos/gst-apps-android
+    ~/repos/gst-apps-ios
+    ~/repos/peacock-mobile-config   ← optional; skipped gracefully if absent
+
+Branch listing  : git fetch + git branch -r
+Commit diff     : git log origin/base..origin/head
+File stats      : git diff --name-only + git diff --shortstat
 """
 
 import logging
 import os
 import re
-from typing import List, Optional
-
-from github import Github, GithubException
+import subprocess
+from typing import List, Optional, Tuple
 
 from models import Feature, PRDiff
 
 logger = logging.getLogger(__name__)
 
-# Matches Jira-style keys like PROJ-123 or ABC-4567
+# Matches Jira-style ticket keys e.g. MOB-1234, PCOCK-56
 _JIRA_ID_RE = re.compile(r"[A-Z]+-\d+")
 
-# Directories / path prefixes that qualify a file as part of a "core module".
-# Override via Config.CORE_MODULE_PATHS at instantiation time.
 _DEFAULT_CORE_PATHS = (
-    "core/",
-    "src/core/",
-    "lib/",
-    "common/",
-    "shared/",
-    "api/",
-    "auth/",
-    "payment/",
-    "database/",
-    "models/",
+    "core/", "src/core/", "lib/", "common/", "shared/",
+    "api/", "auth/", "payment/", "database/", "models/",
 )
+_SOURCE_EXTS = frozenset({
+    ".kt", ".java", ".swift", ".m", ".mm",
+    ".py", ".js", ".ts", ".tsx", ".go", ".rb",
+    ".cpp", ".c", ".h", ".cs",
+})
+_CONFIG_EXTS = frozenset({
+    ".json", ".yaml", ".yml", ".xml", ".gradle",
+    ".plist", ".pbxproj", ".properties", ".env",
+    ".toml", ".ini", ".xcconfig",
+})
+_TEST_MARKERS = ("test", "spec", "Test", "Spec", "__tests__", "androidTest", "iosTest")
 
+
+# ---------------------------------------------------------------------------
+# Low-level git helper
+# ---------------------------------------------------------------------------
+
+def _git(args: List[str], cwd: str) -> Tuple[str, int]:
+    """Run a git command in *cwd*. Returns (stdout, returncode)."""
+    try:
+        r = subprocess.run(
+            ["git"] + args, cwd=cwd,
+            capture_output=True, text=True, timeout=60,
+        )
+        return r.stdout.strip(), r.returncode
+    except (subprocess.TimeoutExpired, FileNotFoundError) as exc:
+        logger.warning("git %s failed: %s", " ".join(args), exc)
+        return "", 1
+
+
+def _is_git_repo(path: str) -> bool:
+    return os.path.isdir(os.path.join(path, ".git"))
+
+
+# ---------------------------------------------------------------------------
+# Public helper used by app.py for branch dropdowns
+# ---------------------------------------------------------------------------
+
+def get_local_branches(repo_path: str) -> List[str]:
+    """Return sorted remote branch names from a local git clone.
+
+    Runs ``git fetch --all`` first so the list reflects the latest state on
+    the remote.  Returns an empty list if the path is not a git repo or if
+    the fetch/branch command fails.
+    """
+    if not _is_git_repo(repo_path):
+        logger.warning("Not a git repo (or not found): %s", repo_path)
+        return []
+
+    # Best-effort fetch — ignore failures (e.g. no network)
+    _git(["fetch", "--all", "--quiet"], repo_path)
+
+    stdout, rc = _git(["branch", "-r", "--format=%(refname:short)"], repo_path)
+    if rc != 0 or not stdout:
+        return []
+
+    priority = ["main", "master", "develop", "release", "staging"]
+    branches = []
+    for line in stdout.splitlines():
+        line = line.strip()
+        if not line or "HEAD" in line:
+            continue
+        name = line.removeprefix("origin/")
+        if name:
+            branches.append(name)
+
+    unique = sorted(set(branches))
+    top  = [b for b in priority if b in unique]
+    rest = [b for b in unique  if b not in priority]
+    return top + rest
+
+
+# ---------------------------------------------------------------------------
+# Main service class
+# ---------------------------------------------------------------------------
 
 class GitHubService:
     def __init__(
         self,
-        token: str,
-        repo: str,
+        token: str,               # kept for API compat — not used; SSH handles auth
+        repo: str,                # "NBCUDTC/gst-apps-android" — used as a label
+        local_path: str = "",     # absolute path to the local clone
         platform: str = "",
         core_module_paths: tuple = _DEFAULT_CORE_PATHS,
         force_core_module: bool = False,
     ) -> None:
-        """
-        Args:
-            token:              GitHub personal-access token or GitHub App token.
-            repo:               Repository in ``owner/name`` format,
-                                e.g. ``NBCUDTC/gst-apps-android``.
-            platform:           Label stamped on every Feature:
-                                ``"android"``, ``"ios"``, or ``"config"``.
-            core_module_paths:  Path prefixes that classify a file as a core module.
-            force_core_module:  When True *every* feature from this repo gets
-                                ``core_module=True`` regardless of file paths.
-                                Used for the config repo (all config changes
-                                are implicitly core and affect both platforms).
-        """
-        self._gh = Github(token)
-        self._repo_name = repo
-        self._repo = self._gh.get_repo(repo)
-        self._platform = platform
-        self._core_paths = core_module_paths
+        self._repo_name       = repo
+        self._local_path      = local_path
+        self._platform        = platform
+        self._core_paths      = core_module_paths
         self._force_core_module = force_core_module
 
     # ------------------------------------------------------------------
@@ -69,129 +130,132 @@ class GitHubService:
 
     def get_merged_features(
         self,
-        base_branch: str = "main",
-        head_branch: str = "develop",
+        base_branch: str = "develop",
+        head_branch: str = "main",
     ) -> List[Feature]:
-        """Return Feature objects for every merged PR from *head_branch* into *base_branch*.
+        """Return Feature objects for commits in *head_branch* not in *base_branch*.
 
-        Each Feature carries a :class:`PRDiff` with full diff statistics
-        (lines added/removed, file categories, test-coverage signal, PR velocity).
-        Only PRs that carry a Jira ID in their title are included.
+        Uses ``git log origin/base..origin/head`` on the local clone.
+        Each commit subject line is scanned for a Jira ID (e.g. MOB-1234).
+        Diff stats are computed once for the full branch range.
         """
-        try:
-            comparison = self._repo.compare(base_branch, head_branch)
-        except GithubException as exc:
-            logger.error("GitHub compare failed (%s..%s): %s", base_branch, head_branch, exc)
+        if not self._local_path or not _is_git_repo(self._local_path):
+            logger.warning("[%s] Local repo not found: %s", self._platform, self._local_path)
             return []
 
-        seen_prs: set = set()
+        # Refresh remote refs
+        _git(["fetch", "--all", "--quiet"], self._local_path)
+
+        base_ref = f"origin/{base_branch}"
+        head_ref = f"origin/{head_branch}"
+
+        log_out, rc = _git(
+            ["log", f"{base_ref}..{head_ref}", "--format=%H|||%s"],
+            self._local_path,
+        )
+        if rc != 0 or not log_out:
+            logger.info(
+                "[%s] No commits between %s..%s (branches may not exist yet)",
+                self._platform, base_branch, head_branch,
+            )
+            return []
+
+        # Build one range-level PRDiff (shared across all features in this repo)
+        range_diff = self._build_range_diff(base_ref, head_ref)
+
+        seen_jira: set = set()
         features: List[Feature] = []
+        pr_counter = 0
 
-        for commit in comparison.commits:
-            for pr in commit.get_pulls():
-                if pr.number in seen_prs:
-                    continue
-                if pr.merged_at is None:
-                    continue
-                seen_prs.add(pr.number)
+        for line in log_out.splitlines():
+            parts = line.split("|||", 1)
+            if len(parts) < 2:
+                continue
+            commit_hash, subject = parts
 
-                jira_id = self._extract_jira_id(pr.title)
-                if not jira_id:
-                    logger.debug("PR #%d has no Jira ID in title, skipping.", pr.number)
-                    continue
+            jira_id = _extract_jira_id(subject)
+            if not jira_id or jira_id in seen_jira:
+                continue
+            seen_jira.add(jira_id)
+            pr_counter += 1
 
-                pr_diff = self._build_pr_diff(pr)
-                files_changed = [f for f in _filenames_from_diff(pr_diff, pr)]
-                is_core = self._force_core_module or self._is_core_module(files_changed)
+            # Files touched by this specific commit
+            files_out, _ = _git(
+                ["diff-tree", "--no-commit-id", "-r", "--name-only", commit_hash],
+                self._local_path,
+            )
+            files_changed = [f for f in files_out.splitlines() if f]
+            is_core = self._force_core_module or self._is_core_module(files_changed)
 
-                features.append(
-                    Feature(
-                        jira_id=jira_id,
-                        pr_number=pr.number,
-                        platform=self._platform,
-                        repo=self._repo_name,
-                        affects_both_platforms=(self._platform == "config"),
-                        files_changed=files_changed,
-                        core_module=is_core,
-                        pr_diff=pr_diff,
-                    )
-                )
-                logger.info(
-                    "[%s] feature=%s PR=#%d churn=%d test_changes=%s",
-                    self._platform, jira_id, pr.number,
-                    pr_diff.churn, pr_diff.has_test_changes,
-                )
+            features.append(Feature(
+                jira_id=jira_id,
+                pr_number=pr_counter,        # sequential — no PR numbers in local git
+                platform=self._platform,
+                repo=self._repo_name,
+                affects_both_platforms=(self._platform == "config"),
+                files_changed=files_changed,
+                core_module=is_core,
+                pr_diff=range_diff,
+            ))
 
+        logger.info(
+            "[%s] %d feature(s) found between %s..%s",
+            self._platform, len(features), base_branch, head_branch,
+        )
         return features
 
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
 
-    _SOURCE_EXTS = frozenset({
-        ".kt", ".java", ".swift", ".m", ".mm",           # mobile
-        ".py", ".js", ".ts", ".tsx", ".go", ".rb",       # backend / scripts
-        ".cpp", ".c", ".h", ".cs",                       # native
-    })
-    _CONFIG_EXTS = frozenset({
-        ".json", ".yaml", ".yml", ".xml", ".gradle",
-        ".plist", ".pbxproj", ".properties", ".env",
-        ".toml", ".ini", ".xcconfig",
-    })
-    _TEST_MARKERS = ("test", "spec", "Test", "Spec", "__tests__", "androidTest", "iosTest")
-
-    def _build_pr_diff(self, pr) -> PRDiff:
-        """Build a :class:`PRDiff` from a PyGithub PullRequest object."""
+    def _build_range_diff(self, base_ref: str, head_ref: str) -> PRDiff:
+        """Compute aggregate diff stats for the full branch range."""
         source = test = config = 0
-        try:
-            gh_files = list(pr.get_files())
-        except GithubException as exc:
-            logger.warning("Could not fetch files for PR #%d: %s", pr.number, exc)
-            gh_files = []
 
-        for f in gh_files:
-            name = f.filename
-            ext  = os.path.splitext(name)[1].lower()
-            if any(m in name for m in self._TEST_MARKERS):
+        files_out, _ = _git(
+            ["diff", "--name-only", f"{base_ref}...{head_ref}"],
+            self._local_path,
+        )
+        all_files = [f for f in files_out.splitlines() if f]
+
+        for name in all_files:
+            ext = os.path.splitext(name)[1].lower()
+            if any(m in name for m in _TEST_MARKERS):
                 test += 1
-            elif ext in self._SOURCE_EXTS:
+            elif ext in _SOURCE_EXTS:
                 source += 1
-            elif ext in self._CONFIG_EXTS:
+            elif ext in _CONFIG_EXTS:
                 config += 1
 
-        days_open = 0
-        if pr.created_at and pr.merged_at:
-            days_open = max(0, (pr.merged_at - pr.created_at).days)
-
-        try:
-            review_count = sum(1 for _ in pr.get_reviews())
-        except GithubException:
-            review_count = 0
+        stat_out, _ = _git(
+            ["diff", "--shortstat", f"{base_ref}...{head_ref}"],
+            self._local_path,
+        )
+        lines_added = lines_removed = 0
+        if stat_out:
+            m = re.search(r"(\d+) insertion", stat_out)
+            if m:
+                lines_added = int(m.group(1))
+            m = re.search(r"(\d+) deletion", stat_out)
+            if m:
+                lines_removed = int(m.group(1))
 
         return PRDiff(
-            lines_added=pr.additions,
-            lines_removed=pr.deletions,
-            total_files=pr.changed_files,
+            lines_added=lines_added,
+            lines_removed=lines_removed,
+            total_files=len(all_files),
             source_files=source,
             test_files=test,
             config_files=config,
             has_test_changes=(test > 0),
-            days_open=days_open,
-            review_count=review_count,
+            days_open=0,
+            review_count=0,
         )
-
-    @staticmethod
-    def _extract_jira_id(title: str) -> Optional[str]:
-        match = _JIRA_ID_RE.search(title)
-        return match.group(0) if match else None
 
     def _is_core_module(self, files: List[str]) -> bool:
         return any(f.startswith(p) for f in files for p in self._core_paths)
 
 
-def _filenames_from_diff(pr_diff: PRDiff, pr) -> List[str]:
-    """Re-use already-fetched file list; fall back to an empty list on error."""
-    try:
-        return [f.filename for f in pr.get_files()]
-    except GithubException:
-        return []
+def _extract_jira_id(text: str) -> Optional[str]:
+    match = _JIRA_ID_RE.search(text)
+    return match.group(0) if match else None

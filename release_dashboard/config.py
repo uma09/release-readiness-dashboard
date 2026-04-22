@@ -27,10 +27,17 @@ class Config:
     # ── GitHub ───────────────────────────────────────────────────────────────
     GITHUB_TOKEN: str = os.getenv("GITHUB_TOKEN", "")
 
-    # Repository slugs (org/repo)
+    # Repository slugs (org/repo) — used as labels only; auth is via SSH key
     GITHUB_REPO_ANDROID: str = os.getenv("GITHUB_REPO_ANDROID", "NBCUDTC/gst-apps-android")
     GITHUB_REPO_IOS: str     = os.getenv("GITHUB_REPO_IOS",     "NBCUDTC/gst-apps-ios")
     GITHUB_REPO_CONFIG: str  = os.getenv("GITHUB_REPO_CONFIG",  "NBCUDTC/peacock-mobile-config")
+
+    # Local clone paths — same repos already on disk (pulled by GitHub Desktop / qa-certification-skill)
+    # SSH key ~/.ssh/id_nbcu handles authentication transparently via git pull.
+    _home = os.path.expanduser("~")
+    GITHUB_LOCAL_REPO_ANDROID: str = os.getenv("GITHUB_LOCAL_REPO_ANDROID", os.path.join(_home, "repos", "gst-apps-android"))
+    GITHUB_LOCAL_REPO_IOS: str     = os.getenv("GITHUB_LOCAL_REPO_IOS",     os.path.join(_home, "repos", "gst-apps-ios"))
+    GITHUB_LOCAL_REPO_CONFIG: str  = os.getenv("GITHUB_LOCAL_REPO_CONFIG",  os.path.join(_home, "repos", "peacock-mobile-config"))
 
     # Shared base branch (the stable / production branch in every repo)
     GITHUB_BASE_BRANCH: str = os.getenv("GITHUB_BASE_BRANCH", "main")

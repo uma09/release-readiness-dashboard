@@ -19,12 +19,11 @@ sys.path.insert(0, os.path.dirname(__file__))
 
 import pandas as pd
 import streamlit as st
-from github import Github, GithubException
 
 from config import Config
 from engine.governance_engine import calculate_risk_for_all
 from models import Feature
-from services.github_service import GitHubService
+from services.github_service import GitHubService, get_local_branches
 from services.jira_service import JiraService
 from services.qmetry_service import QMetryService
 
@@ -35,27 +34,17 @@ st.set_page_config(
     layout="wide",
 )
 
-# ── Branch fetching (cached 5 min) ───────────────────────────────────────────
-# Priority-sorted branch names shown at the top of every dropdown.
-_PRIORITY_BRANCHES = ["main", "master", "develop", "release", "staging"]
-
+# ── Branch fetching — reads LOCAL git clones (no GitHub token needed) ────────
+# SSH key ~/.ssh/id_nbcu handles auth transparently via git fetch.
 
 @st.cache_data(ttl=300, show_spinner=False)
-def _fetch_repo_branches(token: str, repo: str) -> list[str]:
-    """Return sorted branch names for *repo*. Empty list on auth/network error."""
-    if not token:
-        return []
-    try:
-        names = sorted(b.name for b in Github(token).get_repo(repo).get_branches())
-        top  = [b for b in _PRIORITY_BRANCHES if b in names]
-        rest = [b for b in names if b not in _PRIORITY_BRANCHES]
-        return top + rest
-    except GithubException as exc:
-        st.sidebar.warning(f"Could not load branches for `{repo}`: {exc.data.get('message', exc)}")
-        return []
-    except Exception as exc:
-        st.sidebar.warning(f"Branch fetch error for `{repo}`: {exc}")
-        return []
+def _fetch_repo_branches(local_path: str) -> list[str]:
+    """Return sorted branch names from the local git clone at *local_path*.
+
+    Calls ``get_local_branches()`` which runs ``git fetch + git branch -r``.
+    Returns an empty list if the path is not a git repo or fetch fails.
+    """
+    return get_local_branches(local_path)
 
 
 def _branch_select(label: str, branches: list[str], default: str) -> str:
@@ -77,13 +66,17 @@ with st.sidebar:
 
     st.subheader("🌿 Branches")
 
-    # Fetch branches per repo (cached 5 min)
-    if not Config.GITHUB_TOKEN:
-        st.warning("⚠️ Set **GITHUB_TOKEN** to load live branch lists from GitHub.")
-    with st.spinner("Loading branches …"):
-        _branches_android = _fetch_repo_branches(Config.GITHUB_TOKEN, Config.GITHUB_REPO_ANDROID)
-        _branches_ios     = _fetch_repo_branches(Config.GITHUB_TOKEN, Config.GITHUB_REPO_IOS)
-        _branches_config  = _fetch_repo_branches(Config.GITHUB_TOKEN, Config.GITHUB_REPO_CONFIG)
+    # Fetch branches from local git clones (no token needed — SSH key handles auth)
+    with st.spinner("Loading branches from local repos …"):
+        _branches_android = _fetch_repo_branches(Config.GITHUB_LOCAL_REPO_ANDROID)
+        _branches_ios     = _fetch_repo_branches(Config.GITHUB_LOCAL_REPO_IOS)
+        _branches_config  = _fetch_repo_branches(Config.GITHUB_LOCAL_REPO_CONFIG)
+
+    if not any([_branches_android, _branches_ios, _branches_config]):
+        st.warning(
+            "⚠️ No branches loaded. Make sure the repos are cloned at "
+            f"`~/repos/` and SSH key `~/.ssh/id_nbcu` is available."
+        )
 
     # Release branch — union of all three repos so any release/x.x branch is visible
     _all_branches = list(dict.fromkeys(
@@ -296,12 +289,21 @@ def run_validation(
     Result: every commit that is in the release but not yet in develop
             (hotfixes) PLUS all PRs whose commits landed on the release branch.
     """
-    gh_android = GitHubService(Config.GITHUB_TOKEN, Config.GITHUB_REPO_ANDROID,
-                               platform="android", core_module_paths=Config.CORE_MODULE_PATHS_ANDROID)
-    gh_ios     = GitHubService(Config.GITHUB_TOKEN, Config.GITHUB_REPO_IOS,
-                               platform="ios",     core_module_paths=Config.CORE_MODULE_PATHS_IOS)
-    gh_config  = GitHubService(Config.GITHUB_TOKEN, Config.GITHUB_REPO_CONFIG,
-                               platform="config",  force_core_module=True)
+    gh_android = GitHubService(
+        token="", repo=Config.GITHUB_REPO_ANDROID,
+        local_path=Config.GITHUB_LOCAL_REPO_ANDROID,
+        platform="android", core_module_paths=Config.CORE_MODULE_PATHS_ANDROID,
+    )
+    gh_ios = GitHubService(
+        token="", repo=Config.GITHUB_REPO_IOS,
+        local_path=Config.GITHUB_LOCAL_REPO_IOS,
+        platform="ios", core_module_paths=Config.CORE_MODULE_PATHS_IOS,
+    )
+    gh_config = GitHubService(
+        token="", repo=Config.GITHUB_REPO_CONFIG,
+        local_path=Config.GITHUB_LOCAL_REPO_CONFIG,
+        platform="config", force_core_module=True,
+    )
 
     # base = develop, head = release  →  diff shows what's in the release
     android_feats = gh_android.get_merged_features(base_branch=a_dev, head_branch=release)
@@ -328,9 +330,6 @@ def run_validation(
 
 # ── Run button ────────────────────────────────────────────────────────────────
 if st.button("▶️ Run Release Risk Analysis", type="primary", use_container_width=True):
-    if not Config.GITHUB_TOKEN:
-        st.error("GITHUB_TOKEN is not set. Export it as an environment variable and restart.")
-        st.stop()
 
     with st.spinner("🔍 GitHub → Jira → QMetry → Governance Engine …"):
         try:
